@@ -1,11 +1,14 @@
 #! /usr/bin/env python
 
-import pysam
-import argparse
-from collections import defaultdict
-import sys
+import pysam    # Import the pysam module
+import argparse     # Import the argparse module
+from collections import defaultdict     # Import the defaultdict class from the collections module
+import sys      # Import the sys module
 
 class HaplotypeAnalyzer:
+    """
+    Analyzes haplotypes in reads and calculates haplotype scores.
+    """
     def __init__(self, variants, min_supporting_variants):
         """
         Initializes the HaplotypeAnalyzer with given variants and minimum supporting variants.
@@ -27,6 +30,8 @@ class HaplotypeAnalyzer:
         block_size = 0
         ref_pos = read.reference_start
         query_pos = 0
+        switch_score = 0
+        con_score = 0
         
         try:
             line = read.get_tag("LN")
@@ -67,6 +72,9 @@ class HaplotypeAnalyzer:
 
         is_recombinant, breakpoints = self._finalize_score(haplotype_blocks)
 
+        switch_score = self.calculate_phase_switches("".join(haplotype_string))
+        con_score = self.calculate_consecutiveness_score("".join(haplotype_string))
+
         return {
             'read_id': read.query_name,
             'chrom': read.reference_name,
@@ -76,7 +84,9 @@ class HaplotypeAnalyzer:
             'variant_string': ";".join(variant_string),
             'haplotype_string': "".join(haplotype_string),
             'breakpoints': breakpoints,
-            'line': line
+            'line': line,
+            'switch_score': switch_score,
+            'con_score': con_score
         }
 
     def _process_snp(self, read, pos, var, hp1_count, hp2_count, current_haplotype, block_start, block_end, ref_pos, haplotype_blocks, block_size):
@@ -114,7 +124,10 @@ class HaplotypeAnalyzer:
             block_end = ref_pos
             block_size += 1
 
-        return hp1_count, hp2_count, current_haplotype, block_start, block_end, block_size, variant_str, haplotype_str
+
+
+        return (hp1_count, hp2_count, current_haplotype, block_start, block_end, block_size,
+                variant_str, haplotype_str)
 
     def _finalize_score(self, haplotype_blocks):
         """
@@ -138,6 +151,29 @@ class HaplotypeAnalyzer:
                 breakpoints.append(f"{end_pos1}-{start_pos2}")
         
         return is_recombinant, breakpoints
+
+    def calculate_phase_switches(self, haplotype_string):
+        switches = sum(1 for i in range(1, len(haplotype_string)) if
+                       haplotype_string[i] != haplotype_string[i-1] and haplotype_string[i] in '12')
+        return switches / len(haplotype_string) if haplotype_string else 0
+
+    def calculate_consecutiveness_score(self, haplotype_string):
+        def score_for_haplotype(hap):
+            score, consecutive, total_count = 0, 0, haplotype_string.count(hap)
+            for char in haplotype_string:
+                if char == hap:
+                    consecutive += 1
+                    score += consecutive
+                elif char == 'x':
+                    continue
+                else:
+                    consecutive = 0
+            return score / total_count if total_count else 0
+
+        score_1 = score_for_haplotype('1')
+        score_2 = score_for_haplotype('2')
+        average_score = (score_1 + score_2) / 2
+        return average_score / len(haplotype_string) if haplotype_string else 0
 
 def parse_vcf(vcf_file):
     """
@@ -211,7 +247,9 @@ def main():
             f"{result['haplotype_blocks']}\t"
             f"{result['variant_string']}\t"
             f"{result['haplotype_string']}\t"
-            f"{';'.join(breakpoints)}\n"
+            f"{';'.join(breakpoints)}\t"
+            f"{result['switch_score']}\t"
+            f"{result['con_score']}\n"
         )
 
 if __name__ == "__main__":
