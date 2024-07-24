@@ -30,8 +30,7 @@ class HaplotypeAnalyzer:
         block_size = 0
         ref_pos = read.reference_start
         query_pos = 0
-        switch_score = 0
-        con_score = 0
+
         
         try:
             line = read.get_tag("LN")
@@ -228,16 +227,22 @@ def main():
 
     args = parser.parse_args()
 
+    # Capture the command used to run the tool
+    command_used = ' '.join(sys.argv)
+
     variants = parse_vcf(args.vcf)
     results = process_bam(args.bam, variants, args.min_supporting_variants)
 
     output_file = sys.stdout if args.output is None else open(args.output, 'w')
 
-    header = "ReadID\tLine\tChromosome\tStartPos\tIsRecombinant\tHaplotypeBlocks\tVariantString\tHaplotypeString\tBreakpoints\n"
+    # Write the command used as a header in the output file
+    output_file.write(f"# Command: {command_used}\n")
+
+    header = "ReadID\tLine\tChromosome\tStartPos\tIsRecombinant\tHaplotypeBlocks\tVariantString\tHaplotypeString\tBreakpoints\tSwitchScore\tConScore\n"
     output_file.write(header)
     for result in results:
         is_recombinant, breakpoints = result['is_recombinant'], result.get('breakpoints', [])
-        
+
         output_file.write(
             f"{result['read_id']}\t"
             f"{result['line']}\t"
@@ -251,6 +256,9 @@ def main():
             f"{result['switch_score']}\t"
             f"{result['con_score']}\n"
         )
+
+    if args.output is not None:
+        output_file.close()
 
 if __name__ == "__main__":
     main()

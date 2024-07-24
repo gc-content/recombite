@@ -1,14 +1,17 @@
 #! /usr/bin/env python
+from typing import Dict, Union, Any
 
-import pysam
-import argparse
-import sys
+import pysam  # Import the pysam module
+import argparse  # Import the argparse module
+from collections import defaultdict  # Import the defaultdict class from the collections module
+import sys  # Import the sys module
 import multiprocessing
 
 
 def get_chromosome_ranges(bam_file, num_chunks):
     """
     Divide the BAM file's reference chromosomes into ranges for parallel processing.
+    Ensure that each chunk range is exclusive of the end to avoid overlapping processing.
     """
     bam = pysam.AlignmentFile(bam_file, "rb")
     chromosome_ranges = []
@@ -17,8 +20,14 @@ def get_chromosome_ranges(bam_file, num_chunks):
         length = bam.lengths[bam.references.index(chromosome)]
         chunk_size = length // num_chunks
         for start in range(0, length, chunk_size):
-            end = min(start + chunk_size, length)
-            chromosome_ranges.append((chromosome, start, end))
+            end = start + chunk_size
+            if end > length:
+                end = length
+            # Adjust the start of the next range to avoid overlap
+            if end == length:
+                chromosome_ranges.append((chromosome, start, end))
+            else:
+                chromosome_ranges.append((chromosome, start, end - 1))
 
     bam.close()
     return chromosome_ranges
@@ -114,6 +123,9 @@ class HaplotypeAnalyzer:
 
         is_recombinant, breakpoints = self._finalize_score(haplotype_blocks)
 
+        switch_score = self.calculate_phase_switches("".join(haplotype_string))
+        con_score = self.calculate_consecutiveness_score("".join(haplotype_string))
+
         return {
             'read_id': read.query_name,
             'chrom': read.reference_name,
@@ -123,7 +135,9 @@ class HaplotypeAnalyzer:
             'variant_string': ";".join(variant_string),
             'haplotype_string': "".join(haplotype_string),
             'breakpoints': breakpoints,
-            'line': line
+            'line': line,
+            'switch_score': switch_score,
+            'con_score': con_score
         }
 
     def _process_snp(self, read, pos, var, hp1_count, hp2_count, current_haplotype, block_start, block_end, ref_pos,
@@ -178,9 +192,36 @@ class HaplotypeAnalyzer:
 
         return is_recombinant, breakpoints
 
+    def calculate_phase_switches(self, haplotype_string):
+        switches = sum(1 for i in range(1, len(haplotype_string)) if
+                       haplotype_string[i] != haplotype_string[i - 1] and haplotype_string[i] in '12')
+        return switches / len(haplotype_string) if haplotype_string else 0
+
+    def calculate_consecutiveness_score(self, haplotype_string):
+        def score_for_haplotype(hap):
+            score, consecutive, total_count = 0, 0, haplotype_string.count(hap)
+            for char in haplotype_string:
+                if char == hap:
+                    consecutive += 1
+                    score += consecutive
+                elif char == 'x':
+                    continue
+                else:
+                    consecutive = 0
+            return score / total_count if total_count else 0
+
+        score_1 = score_for_haplotype('1')
+        score_2 = score_for_haplotype('2')
+        average_score = (score_1 + score_2) / 2
+        return average_score / len(haplotype_string) if haplotype_string else 0
+
+
+def defaultdict_of_dict():
+    return defaultdict(dict)
+
 
 def parse_vcf(vcf_file):
-    variants = {}
+    variants = defaultdict(defaultdict_of_dict)
     with open(vcf_file, 'r') as vcf:
         for line in vcf:
             if line.startswith('#'):
@@ -209,14 +250,39 @@ def main():
     parser.add_argument("-b", "--bam", required=True, help="Input BAM file with aligned reads.")
     parser.add_argument("-m", "--min_supporting_variants", type=int, default=2,
                         help="Minimum number of supporting variants to consider a phase switch.")
-    parser.add_argument("-w", "--workers", type=int, default=4, help="Number of worker processes to use.")
+    parser.add_argument("-t", "--threads", type=int, default=4, help="Number of worker processes to use.")
+    parser.add_argument("-o", "--output", help="Output file to write results. Writes to stdout if not specified.")
     args = parser.parse_args()
 
     variants = parse_vcf(args.vcf)
-    results = process_bam(args.bam, variants, args.min_supporting_variants, num_workers=args.workers)
+    results = process_bam(args.bam, variants, args.min_supporting_variants, num_workers=args.threads)
+
+    output_file = sys.stdout if args.output is None else open(args.output, 'w')
+
+    header = "ReadID\tLine\tChromosome\tStartPos\tIsRecombinant\tHaplotypeBlocks\tVariantString\tHaplotypeString\tBreakpoints\tSwitchScore\tConScore\n"
+    output_file.write(header)
 
     for result in results:
-        print(result)
+        haplotype_blocks_str = ";".join([f"{block[0]}-{block[1]}:{block[2]}:{block[3]}" for block in result['haplotype_blocks']])
+        breakpoints_str = ";".join(result['breakpoints'])
+
+        line = (
+            f"{result['read_id']}\t"
+            f"{result['line']}\t"
+            f"{result['chrom']}\t"
+            f"{result['start_pos']}\t"
+            f"{result['is_recombinant']}\t"
+            f"{haplotype_blocks_str}\t"
+            f"{result['variant_string']}\t"
+            f"{result['haplotype_string']}\t"
+            f"{breakpoints_str}\t"
+            f"{result['switch_score']}\t"
+            f"{result['con_score']}\n"
+        )
+        output_file.write(line)
+
+    if args.output is not None:
+        output_file.close()
 
 
 if __name__ == "__main__":
