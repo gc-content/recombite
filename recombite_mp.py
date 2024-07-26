@@ -1,6 +1,4 @@
 #! /usr/bin/env python
-from typing import Dict, Union, Any
-
 import pysam  # Import the pysam module
 import argparse  # Import the argparse module
 from collections import defaultdict  # Import the defaultdict class from the collections module
