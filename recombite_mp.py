@@ -31,12 +31,9 @@ def get_chromosome_ranges(bam_file, num_chunks):
     return chromosome_ranges
 
 
-def process_bam_chunk(bam_file, variants, min_supporting_variants, chunk):
-    """
-    Process a specific chunk of the BAM file.
-    """
+def process_bam_chunk(bam_file, variants, min_supporting_variants, continuity_threshold, switch_threshold, chunk):
     chromosome, start, end = chunk
-    analyzer = HaplotypeAnalyzer(variants, min_supporting_variants)
+    analyzer = HaplotypeAnalyzer(variants, min_supporting_variants, continuity_threshold, switch_threshold)
     results = []
 
     with pysam.AlignmentFile(bam_file, "rb") as bam:
@@ -49,16 +46,13 @@ def process_bam_chunk(bam_file, variants, min_supporting_variants, chunk):
     return results
 
 
-def process_bam(bam_file, variants, min_supporting_variants, num_workers=4):
-    """
-    Main function to process the BAM file with multiprocessing.
-    """
+def process_bam(bam_file, variants, min_supporting_variants, continuity_threshold, switch_threshold, num_workers=4):
     chromosome_ranges = get_chromosome_ranges(bam_file, num_workers)
 
     with multiprocessing.Pool(processes=num_workers) as pool:
         results = pool.starmap(
             process_bam_chunk,
-            [(bam_file, variants, min_supporting_variants, chunk) for chunk in chromosome_ranges]
+            [(bam_file, variants, min_supporting_variants, continuity_threshold, switch_threshold, chunk) for chunk in chromosome_ranges]
         )
 
     # Flatten the list of results
@@ -66,9 +60,11 @@ def process_bam(bam_file, variants, min_supporting_variants, num_workers=4):
 
 
 class HaplotypeAnalyzer:
-    def __init__(self, variants, min_supporting_variants):
+    def __init__(self, variants, min_supporting_variants, continuity_threshold, switch_threshold):
         self.variants = variants
         self.min_supporting_variants = min_supporting_variants
+        self.continuity_threshold = continuity_threshold
+        self.switch_threshold = switch_threshold
 
     def calculate_score(self, read):
         hp1_count, hp2_count = 0, 0
@@ -119,10 +115,11 @@ class HaplotypeAnalyzer:
         if current_haplotype is not None and block_size >= self.min_supporting_variants:
             haplotype_blocks.append((block_start, block_end, current_haplotype, block_size))
 
-        is_recombinant, breakpoints = self._finalize_score(haplotype_blocks)
 
         switch_score = self.calculate_phase_switches("".join(haplotype_string))
         con_score = self.calculate_consecutiveness_score("".join(haplotype_string))
+
+        is_recombinant, breakpoints = self._finalize_score(haplotype_blocks, switch_score, con_score)
 
         return {
             'read_id': read.query_name,
@@ -173,14 +170,15 @@ class HaplotypeAnalyzer:
 
         return hp1_count, hp2_count, current_haplotype, block_start, block_end, block_size, variant_str, haplotype_str
 
-    def _finalize_score(self, haplotype_blocks):
+    def _finalize_score(self, haplotype_blocks, switch_score, con_score):
         is_recombinant = False
         breakpoints = []
 
         for i in range(len(haplotype_blocks) - 1):
             if (haplotype_blocks[i][3] >= self.min_supporting_variants and
                     haplotype_blocks[i + 1][3] >= self.min_supporting_variants and
-                    haplotype_blocks[i][2] != haplotype_blocks[i + 1][2]):
+                    haplotype_blocks[i][2] != haplotype_blocks[i + 1][2]) and (
+                    switch_score < self.switch_threshold and con_score > self.continuity_threshold):
                 is_recombinant = True
 
                 end_pos1 = haplotype_blocks[i][1]
@@ -190,12 +188,14 @@ class HaplotypeAnalyzer:
 
         return is_recombinant, breakpoints
 
-    def calculate_phase_switches(self, haplotype_string):
+    @staticmethod
+    def calculate_phase_switches(haplotype_string):
         switches = sum(1 for i in range(1, len(haplotype_string)) if
                        haplotype_string[i] != haplotype_string[i - 1] and haplotype_string[i] in '12')
         return switches / len(haplotype_string) if haplotype_string else 0
 
-    def calculate_consecutiveness_score(self, haplotype_string):
+    @staticmethod
+    def calculate_consecutiveness_score(haplotype_string):
         def score_for_haplotype(hap):
             score, consecutive, total_count = 0, 0, haplotype_string.count(hap)
             for char in haplotype_string:
@@ -250,10 +250,15 @@ def main():
                         help="Minimum number of supporting variants to consider a phase switch.")
     parser.add_argument("-t", "--threads", type=int, default=4, help="Number of worker processes to use.")
     parser.add_argument("-o", "--output", help="Output file to write results. Writes to stdout if not specified.")
+    parser.add_argument("-c", "--continuity_threshold", type=float, default=0.2,
+                        help="Threshold for continuity score to determine recombination.")
+    parser.add_argument("-s", "--switch_threshold", type=float, default=0.01,
+                        help="Threshold for switch score to determine recombination.")
     args = parser.parse_args()
 
     variants = parse_vcf(args.vcf)
-    results = process_bam(args.bam, variants, args.min_supporting_variants, num_workers=args.threads)
+    results = process_bam(args.bam, variants, args.min_supporting_variants, args.continuity_threshold,
+                          args.switch_threshold, num_workers=args.threads)
 
     output_file = sys.stdout if args.output is None else open(args.output, 'w')
 
