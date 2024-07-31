@@ -32,10 +32,10 @@ def get_chromosome_ranges(bam_file, num_chunks):
 
 
 def process_bam_chunk(bam_file, variants, min_supporting_variants, continuity_threshold, switch_threshold,
-                      min_mapping_quality, min_read_length, chunk, min_variant_quality):
+                      dominant_fraction_threshold, min_mapping_quality, min_read_length, chunk, min_variant_quality):
     chromosome, start, end = chunk
     analyzer = HaplotypeAnalyzer(variants, min_supporting_variants, continuity_threshold,
-                                 switch_threshold, min_variant_quality)
+                                 switch_threshold, dominant_fraction_threshold, min_variant_quality)
     results = []
 
     with pysam.AlignmentFile(bam_file, "rb") as bam:
@@ -50,14 +50,15 @@ def process_bam_chunk(bam_file, variants, min_supporting_variants, continuity_th
 
 
 def process_bam(bam_file, variants, min_supporting_variants, continuity_threshold, switch_threshold,
-                min_mapping_quality, min_read_length, min_variant_quality, num_workers=4):
+                dominant_fraction_threshold, min_mapping_quality, min_read_length, min_variant_quality, num_workers=4):
     chromosome_ranges = get_chromosome_ranges(bam_file, num_workers)
 
     with multiprocessing.Pool(processes=num_workers) as pool:
         results = pool.starmap(
             process_bam_chunk,
-            [(bam_file, variants, min_supporting_variants, continuity_threshold, switch_threshold, min_mapping_quality,
-              min_read_length, chunk, min_variant_quality) for chunk in chromosome_ranges]
+            [(bam_file, variants, min_supporting_variants, continuity_threshold, switch_threshold,
+              dominant_fraction_threshold, min_mapping_quality, min_read_length, chunk, min_variant_quality)
+             for chunk in chromosome_ranges]
         )
 
     return [item for sublist in results for item in sublist]
@@ -138,7 +139,7 @@ class HaplotypeAnalyzer:
         # Check if the read is recombinant
         is_recombinant, previous_read_id, breakpoints = self.is_recombinant(
             chrom_line_key, haplotype_blocks, switch_score, con_score, dominant_haplotype, dominant_fraction,
-            read.query_name, dominant_phase_set
+            dominant_phase_set
         )
 
         # Store the current read's info if it has a valid dominant haplotype
@@ -165,7 +166,7 @@ class HaplotypeAnalyzer:
             'con_score': con_score
         }
 
-    def is_recombinant(self, chrom_line_key, haplotype_blocks, switch_score, con_score, dominant_haplotype, dominant_fraction, current_read_id, dominant_phase_set):
+    def is_recombinant(self, chrom_line_key, haplotype_blocks, switch_score, con_score, dominant_haplotype, dominant_fraction, dominant_phase_set):
         """Determines if the current read is recombinant, based on single-read and multi-read logic."""
         # Initialize recombination status
         is_recombinant = False
@@ -369,8 +370,8 @@ def main():
 
     variants = parse_vcf(args.vcf)
     results = process_bam(args.bam, variants, args.min_supporting_variants, args.continuity_threshold,
-                          args.switch_threshold, args.min_mapping_quality, args.min_read_length, args.min_variant_quality,
-                          num_workers=args.threads)
+                          args.switch_threshold, args.dominant_fraction_threshold, args.min_mapping_quality,
+                          args.min_read_length, args.min_variant_quality, num_workers=args.threads)
 
     output_file = sys.stdout if args.output is None else open(args.output, 'w')
 
