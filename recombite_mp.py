@@ -217,8 +217,13 @@ class HaplotypeAnalyzer:
             prev_read_info = self.previous_read_info[chrom_line_key]
             prev_haplotype = prev_read_info['dominant_haplotype']
             prev_phase_set = prev_read_info['dominant_phase_set']
+            prev_haplotype_blocks = prev_read_info['haplotype_blocks']
 
-            if current_haplotype != prev_haplotype and dominant_phase_set == prev_phase_set:
+            # Ensure no overlap between the current and previous read haplotype blocks
+            if (prev_haplotype_blocks[-1][1] < current_haplotype_blocks[0][0] and
+                    current_haplotype != prev_haplotype and
+                    dominant_phase_set == prev_phase_set):
+
                 # Determine breakpoints between reads
                 is_recombinant = True
                 breakpoints = self._calculate_breakpoints(prev_read_info, current_haplotype_blocks)
