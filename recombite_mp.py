@@ -18,14 +18,8 @@ def get_chromosome_ranges(bam_file, num_chunks):
         length = bam.lengths[bam.references.index(chromosome)]
         chunk_size = length // num_chunks
         for start in range(0, length, chunk_size):
-            end = start + chunk_size
-            if end > length:
-                end = length
-            # Adjust the start of the next range to avoid overlap
-            if end == length:
-                chromosome_ranges.append((chromosome, start, end))
-            else:
-                chromosome_ranges.append((chromosome, start, end - 1))
+            end = min(start + chunk_size, length)
+            chromosome_ranges.append((chromosome, start, end))
 
     bam.close()
     return chromosome_ranges
@@ -362,9 +356,9 @@ def main():
                         help="Minimum number of supporting variants to consider a phase switch.")
     parser.add_argument("-t", "--threads", type=int, default=4, help="Number of worker processes to use.")
     parser.add_argument("-o", "--output", help="Output file to write results. Writes to stdout if not specified.")
-    parser.add_argument("-c", "--continuity_threshold", type=float, default=0.2,
+    parser.add_argument("-c", "--continuity_threshold", type=float, default=0.15,
                         help="Threshold for continuity score to determine recombination.")
-    parser.add_argument("-s", "--switch_threshold", type=float, default=0.01,
+    parser.add_argument("-s", "--switch_threshold", type=float, default=0.1,
                         help="Threshold for switch score to determine recombination.")
     parser.add_argument("--dominant_fraction_threshold", type=float, default=0.9,
                         help="Fraction threshold for determining dominant haplotype.")
