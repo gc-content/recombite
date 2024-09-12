@@ -29,7 +29,7 @@ def process_bam_chunk(bam_file, variants, min_supporting_variants, continuity_th
                       dominant_fraction_threshold, min_mapping_quality, min_read_length, chunk, min_variant_quality):
     chromosome, start, end = chunk
     analyzer = HaplotypeAnalyzer(variants, min_supporting_variants, continuity_threshold,
-                                 switch_threshold, dominant_fraction_threshold, min_variant_quality)
+                                 switch_threshold, dominant_fraction_threshold, min_variant_quality, k_consecutive=2)
     results = []
 
     with pysam.AlignmentFile(bam_file, "rb") as bam:
@@ -60,7 +60,8 @@ def process_bam(bam_file, variants, min_supporting_variants, continuity_threshol
 
 
 class HaplotypeAnalyzer:
-    def __init__(self, variants, min_supporting_variants, continuity_threshold, switch_threshold, dominant_fraction_threshold=0.9, min_variant_quality=20):
+    def __init__(self, variants, min_supporting_variants, continuity_threshold, switch_threshold,
+                 dominant_fraction_threshold=0.9, min_variant_quality=20, k_consecutive=3):
         self.variants = variants
         self.min_supporting_variants = min_supporting_variants
         self.continuity_threshold = continuity_threshold
@@ -68,6 +69,10 @@ class HaplotypeAnalyzer:
         self.dominant_fraction_threshold = dominant_fraction_threshold
         self.previous_read_info = {}  # Dictionary to store the last read's information
         self.min_variant_quality = min_variant_quality
+        self.k_consecutive = k_consecutive  # Number of consecutive reads required to support a decision
+        self.consecutive_reads = defaultdict(list)  # Store last reads info for each line/chromosome combination
+        self.current_haplotype_state = defaultdict(lambda: {'haplotype': None, 'count': 0})
+
 
     def calculate_score(self, read):
         hp1_count, hp2_count = 0, 0
@@ -131,13 +136,13 @@ class HaplotypeAnalyzer:
         chrom_line_key = (read.reference_name, line)
 
         # Check if the read is recombinant
-        is_recombinant, previous_read_id, breakpoints = self.is_recombinant(
+        is_recombinant, previous_read_id, breakpoints = (False, None, []) if not haplotype_blocks else self.is_recombinant(
             chrom_line_key, haplotype_blocks, switch_score, con_score, dominant_haplotype, dominant_fraction,
-            dominant_phase_set
+            dominant_phase_set, read.query_name, line
         )
 
         # Store the current read's info if it has a valid dominant haplotype
-        if dominant_haplotype is not None and dominant_fraction >= self.dominant_fraction_threshold and line is not "none":
+        if dominant_haplotype is not None and dominant_fraction >= self.dominant_fraction_threshold and line != "none":
             self.previous_read_info[chrom_line_key] = {
                 'dominant_haplotype': dominant_haplotype,
                 'haplotype_blocks': haplotype_blocks,
@@ -160,7 +165,7 @@ class HaplotypeAnalyzer:
             'con_score': con_score
         }
 
-    def is_recombinant(self, chrom_line_key, haplotype_blocks, switch_score, con_score, dominant_haplotype, dominant_fraction, dominant_phase_set):
+    def is_recombinant(self, chrom_line_key, haplotype_blocks, switch_score, con_score, dominant_haplotype, dominant_fraction, dominant_phase_set, read_name, line):
         """Determines if the current read is recombinant, based on single-read and multi-read logic."""
         # Initialize recombination status
         is_recombinant = False
@@ -174,9 +179,9 @@ class HaplotypeAnalyzer:
             breakpoints = single_read_breakpoints
 
         # Check for multi-read recombination if no single-read recombination occurred
-        if not is_recombinant and dominant_haplotype is not None and dominant_fraction >= self.dominant_fraction_threshold:
+        if not is_recombinant and dominant_haplotype is not None and line != "none" and dominant_fraction >= self.dominant_fraction_threshold:
             multi_read_recombinant, multi_read_breakpoints, previous_read_id = self.is_multi_read_recombinant(
-                chrom_line_key, dominant_haplotype, haplotype_blocks, dominant_phase_set
+                chrom_line_key, dominant_haplotype, haplotype_blocks, read_name, dominant_phase_set
             )
             if multi_read_recombinant:
                 is_recombinant = True
@@ -201,42 +206,69 @@ class HaplotypeAnalyzer:
 
         return is_recombinant, breakpoints
 
-    def is_multi_read_recombinant(self, chrom_line_key, current_haplotype, current_haplotype_blocks, dominant_phase_set):
-        """Checks if the recombination event involves consecutive reads."""
+    def is_multi_read_recombinant(self, chrom_line_key, current_haplotype, current_haplotype_blocks, read_name, dominant_phase_set):
+        """Checks if the recombination event involves consecutive reads before and after a switch and calculates the correct breakpoints."""
         is_recombinant = False
         previous_read_id = None
         breakpoints = []
+        # Store the current read in the list of consecutive reads
+        self.consecutive_reads[chrom_line_key].append({
+            'dominant_haplotype': current_haplotype,
+            'dominant_phase_set': dominant_phase_set,
+            'haplotype_blocks': current_haplotype_blocks,
+            'read_id': read_name,
+            'start': current_haplotype_blocks[0][0],  # Access the 'start' from the first tuple
+            'end': current_haplotype_blocks[-1][1],  # Access the 'end' from the last tuple
+        })
 
-        if chrom_line_key in self.previous_read_info:
-            prev_read_info = self.previous_read_info[chrom_line_key]
-            prev_haplotype = prev_read_info['dominant_haplotype']
-            prev_phase_set = prev_read_info['dominant_phase_set']
-            prev_haplotype_blocks = prev_read_info['haplotype_blocks']
+        # Ensure we are only looking at the last `2 * k_consecutive + 1` reads
+        if len(self.consecutive_reads[chrom_line_key]) > 2 * self.k_consecutive + 1:
+            self.consecutive_reads[chrom_line_key].pop(0)
 
-            # Ensure no overlap between the current and previous read haplotype blocks
-            if (prev_haplotype_blocks[-1][1] < current_haplotype_blocks[0][0] and
-                    current_haplotype != prev_haplotype and
-                    dominant_phase_set == prev_phase_set):
+        # Check if we have enough consecutive reads (before and after) to analyze
+        if len(self.consecutive_reads[chrom_line_key]) < 2 * self.k_consecutive + 1:
+            return is_recombinant, breakpoints, previous_read_id
 
-                # Determine breakpoints between reads
-                is_recombinant = True
-                breakpoints = self._calculate_breakpoints(prev_read_info, current_haplotype_blocks)
-                previous_read_id = prev_read_info['read_id']
+        # Extract the reads before, during, and after the potential crossover event
+        reads_before = self.consecutive_reads[chrom_line_key][:self.k_consecutive]
+        middle_read = self.consecutive_reads[chrom_line_key][self.k_consecutive]
+        reads_after = self.consecutive_reads[chrom_line_key][self.k_consecutive + 1:]
+
+        # Check if there is a stable haplotype before and after the middle read
+        stable_before = all(
+            read['dominant_haplotype'] == reads_before[0]['dominant_haplotype'] for read in reads_before)
+        stable_after = all(read['dominant_haplotype'] == reads_after[0]['dominant_haplotype'] for read in reads_after)
+
+        if stable_before and stable_after and reads_before[0]['dominant_haplotype'] != reads_after[0][
+            'dominant_haplotype'] and reads_before[0]['dominant_phase_set'] == reads_after[0]['dominant_phase_set']:
+            # If the haplotype switches and remains stable both before and after the switch
+            is_recombinant = True
+            previous_read_id = middle_read['read_id']
+
+            # Calculate the breakpoints
+            breakpoints = self._calculate_breakpoints(reads_before, reads_after)
+            breakpoints = [f"{breakpoints[0]}-{breakpoints[1]}"]
 
         return is_recombinant, breakpoints, previous_read_id
 
-    def _calculate_breakpoints(self, prev_read_info, current_haplotype_blocks):
-        """Calculates the breakpoints between the last variant of the previous read and the first variant of the current read."""
-        if not current_haplotype_blocks or not prev_read_info['haplotype_blocks']:
-            return []
+    def _calculate_breakpoints(self, reads_before, reads_after):
+        """
+        Calculates the breakpoints between haplotype 1 and haplotype 2.
 
-        prev_last_block = prev_read_info['haplotype_blocks'][-1]
-        curr_first_block = current_haplotype_blocks[0]
+        Breakpoint should be between the last variant in the last read of haplotype 1
+        and the first variant in the first read of haplotype 2.
+        """
+        # Handle ties by read ID or other features if necessary
+        last_read_before = max(reads_before, key=lambda x: (x['end'], x['read_id']))
+        last_haplotype1_position = last_read_before['end']  # End of the last read covering haplotype 1
 
-        if prev_last_block[2] != curr_first_block[2]:
-            return [f"{prev_last_block[1]}-{curr_first_block[0]}"]
+        first_read_after = min(reads_after, key=lambda x: (x['start'], x['read_id']))
+        first_haplotype2_position = first_read_after['start']  # Start of the first read covering haplotype 2
 
-        return []
+        # The breakpoint is between the last haplotype 1 position and the first haplotype 2 position
+        return [last_haplotype1_position, first_haplotype2_position]
+
+
 
     @staticmethod
     def calculate_dominant_haplotype(haplotype_string):
@@ -287,8 +319,30 @@ class HaplotypeAnalyzer:
 
     def _process_snp(self, read, pos, var, hp1_count, hp2_count, current_haplotype, block_start, block_end, ref_pos,
                      haplotype_blocks, block_size):
+        """
+        Processes a single SNP (Single Nucleotide Polymorphism) and updates haplotype counts and blocks accordingly.
+
+        Arguments:
+        - read: The read being processed
+        - pos: Position in the read's query sequence
+        - var: The variant information (from VCF) at this position
+        - hp1_count: Count of hp1 variants in the read
+        - hp2_count: Count of hp2 variants in the read
+        - current_haplotype: The current haplotype being followed in this block (hp1 or hp2)
+        - block_start: Start of the current haplotype block
+        - block_end: End of the current haplotype block
+        - ref_pos: The reference position being processed
+        - haplotype_blocks: List of haplotype blocks identified so far
+        - block_size: Number of variants in the current haplotype block
+
+        Returns:
+        Updated counts and block information after processing this SNP.
+        """
         read_base = read.query_sequence[pos]
         variant_str = f"{ref_pos}:{read.query_sequence[pos]}:{'hp1' if read_base == var['hp1'] else 'hp2'}:{read.query_qualities[pos]}:"
+
+        # Phase set must match to continue processing the current haplotype
+        current_phase_set = var['ps']
 
         if read_base == var['hp1']:
             haplotype_str = '1'
@@ -297,9 +351,10 @@ class HaplotypeAnalyzer:
         else:
             haplotype_str = 'x'
 
+        # Check for haplotype switch or phase set switch
         if read_base == var['hp1']:
             hp1_count += 1
-            if current_haplotype != 'hp1':
+            if current_haplotype != 'hp1' or (block_size > 0 and current_phase_set != self.previous_phase_set):
                 if current_haplotype is not None and block_size >= self.min_supporting_variants:
                     haplotype_blocks.append((block_start, block_end, current_haplotype, block_size))
                 current_haplotype = 'hp1'
@@ -309,7 +364,7 @@ class HaplotypeAnalyzer:
             block_size += 1
         elif read_base == var['hp2']:
             hp2_count += 1
-            if current_haplotype != 'hp2':
+            if current_haplotype != 'hp2' or (block_size > 0 and current_phase_set != self.previous_phase_set):
                 if current_haplotype is not None and block_size >= self.min_supporting_variants:
                     haplotype_blocks.append((block_start, block_end, current_haplotype, block_size))
                 current_haplotype = 'hp2'
@@ -318,8 +373,11 @@ class HaplotypeAnalyzer:
             block_end = ref_pos
             block_size += 1
 
-        return hp1_count, hp2_count, current_haplotype, block_start, block_end, block_size, variant_str, haplotype_str, var['ps']
+        # Update the previous phase set to the current one
+        self.previous_phase_set = current_phase_set
 
+        return hp1_count, hp2_count, current_haplotype, block_start, block_end, block_size, variant_str, haplotype_str, \
+        var['ps']
 def defaultdict_of_dict():
     return defaultdict(dict)
 
@@ -352,7 +410,7 @@ def main():
     parser = argparse.ArgumentParser(description="Detect recombination events in reads.")
     parser.add_argument("-v", "--vcf", required=True, help="Input VCF file with phased variants.")
     parser.add_argument("-b", "--bam", required=True, help="Input BAM file with aligned reads.")
-    parser.add_argument("-m", "--min_supporting_variants", type=int, default=2,
+    parser.add_argument("-m", "--min_supporting_variants", type=int, default=5,
                         help="Minimum number of supporting variants to consider a phase switch.")
     parser.add_argument("-t", "--threads", type=int, default=4, help="Number of worker processes to use.")
     parser.add_argument("-o", "--output", help="Output file to write results. Writes to stdout if not specified.")
@@ -380,7 +438,8 @@ def main():
 
     for result in results:
         haplotype_blocks_str = ";".join([f"{block[0]}-{block[1]}:{block[2]}:{block[3]}" for block in result['haplotype_blocks']])
-        breakpoints_str = ";".join(result['breakpoints'])
+        breakpoints_str = ";".join(map(str, result['breakpoints']))
+
 
         line = (
             f"{result['read_id']}\t"
