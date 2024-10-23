@@ -94,16 +94,18 @@ class HaplotypeAnalyzer:
             line = "none"
 
         for cigar_op, length in read.cigartuples:
-            if cigar_op in [0, 7, 8]:  # Match, =, X
+            if cigar_op in [0, 7, 8]:  # Match, =, X (regular aligned bases)
                 for i in range(length):
                     pos = ref_pos + i
                     if read.reference_name in self.variants and pos in self.variants[read.reference_name]:
-                        if read.query_qualities[query_pos + i - 1] < self.min_variant_quality:  ## add parameter to parser
+                        if read.query_qualities[query_pos + i-1] < self.min_variant_quality:  # SNP-specific quality check
                             variant_string.append(
                                 f"{pos}:{read.query_sequence[query_pos + i - 1]}:{read.query_qualities[query_pos + i - 1]}:quality")
                             continue
+
                         var = self.variants[read.reference_name][pos]
-                        if len(var['ref']) == 1 and len(var['alt']) == 1:  # SNP
+                        if len(var['ref']) == 1 and len(var['alt']) == 1:  # SNP case
+                            # Process SNPs
                             hp1_count, hp2_count, current_haplotype, block_start, block_end, block_size, variant_str, haplotype_str, phase_set = self._process_snp(
                                 read, query_pos + i - 1, var, hp1_count, hp2_count, current_haplotype, block_start,
                                 block_end, pos, haplotype_blocks, block_size
@@ -111,14 +113,29 @@ class HaplotypeAnalyzer:
                             ps_list.append(phase_set)
                             variant_string.append(variant_str)
                             haplotype_string.append(haplotype_str)
+
                 query_pos += length
                 ref_pos += length
 
-            elif cigar_op == 1:  # Insertion
-                query_pos += length
+            elif cigar_op == 1 or cigar_op == 2:  # Insertions or Deletions
+                pos = ref_pos if cigar_op == 2 else ref_pos   # For deletions, pos should be at ref_pos; for insertions, it's at the prior position.
+                if read.reference_name in self.variants and pos in self.variants[read.reference_name]:
+                    var = self.variants[read.reference_name][pos]
 
-            elif cigar_op == 2:  # Deletion
-                ref_pos += length
+                    # Process Indels (either insertion or deletion based on cigar_op)
+                    hp1_count, hp2_count, current_haplotype, block_start, block_end, block_size, variant_str, haplotype_str, phase_set = self._process_indel(
+                        read, query_pos , var, hp1_count, hp2_count, current_haplotype, block_start, block_end, pos,
+                        haplotype_blocks, block_size, cigar_op, length
+                    )
+                    ps_list.append(phase_set)
+                    variant_string.append(variant_str)
+                    haplotype_string.append(haplotype_str)
+
+                # Advance positions after indels (insertion affects query position, deletion affects reference position)
+                if cigar_op == 1:  # Insertion
+                    query_pos += length
+                elif cigar_op == 2:  # Deletion
+                    ref_pos += length
 
             elif cigar_op == 4:  # Soft clipping
                 query_pos += length
@@ -462,8 +479,115 @@ class HaplotypeAnalyzer:
 
         return hp1_count, hp2_count, current_haplotype, block_start, block_end, block_size, variant_str, haplotype_str, \
         var['ps']
+
+    def _process_indel(self, read, query_pos, variant, hp1_count, hp2_count, current_haplotype, block_start, block_end,
+                       pos, haplotype_blocks, block_size, cigar_op,length):
+        """
+        Processes an indel (insertion or deletion) and handles sequence comparison, quality checks, haplotype phase, and block management.
+
+        Args:
+            - cigar_op: Indicates whether it's an insertion (1) or deletion (2)
+        """
+        ref_seq = variant['ref']
+        alt_seq = variant['alt']
+        tolerance_percentage = 0.1  # Configurable tolerance
+
+        # Handle insertions
+        if cigar_op == 1:  # Insertion
+            read_seq = read.query_sequence[query_pos-1:query_pos-1 + len(alt_seq)]
+            inserted_qualities = read.query_qualities[query_pos-1:query_pos-1 + len(alt_seq)]
+            mean_quality = sum(inserted_qualities) / len(inserted_qualities)
+
+            if mean_quality < self.min_variant_quality:
+                return hp1_count, hp2_count, current_haplotype, block_start, block_end, block_size, f"{pos}:+{alt_seq}:low_quality", "", None
+
+            # Sequence comparison with tolerance using Levenshtein (for insertions)
+            levenshtein_dist = levenshtein_distance(read_seq, alt_seq)
+            max_mismatches = int(len(alt_seq) * tolerance_percentage)
+
+            if levenshtein_dist > max_mismatches:
+                #print(variant, file=sys.stderr)
+                #print(f"{read.query_name} {pos} {read_seq} {alt_seq} {levenshtein_dist} {max_mismatches}", file=sys.stderr)
+                return hp1_count, hp2_count, current_haplotype, block_start, block_end, block_size, f"{pos}:+{alt_seq}:mismatch", "", None
+
+        # Handle deletions
+        elif cigar_op == 2:  # Deletion
+            deletion_length = len(ref_seq)-1
+
+            # Calculate allowed wiggle room based on tolerance_percentage
+            tolerance = int(deletion_length * tolerance_percentage)
+            min_length = deletion_length - tolerance
+            max_length = deletion_length + tolerance
+
+            # If the CIGAR length is outside the allowed range, report a length mismatch
+            if not (min_length <= length <= max_length):  # `length` comes from the CIGAR tuple
+                #print(variant, file=sys.stderr)
+                #print (f"{read.query_name} {pos} {deletion_length} {length} {min_length} {max_length}", file=sys.stderr)
+                return hp1_count, hp2_count, current_haplotype, block_start, block_end, block_size, f"{pos}:-{ref_seq}:length_mismatch", "", None
+
+        # Determine the haplotype from the variant (not the read!)
+        if alt_seq == variant['hp1']:
+            haplotype_str = '1'
+            hp1_count += 1
+            if current_haplotype != 'hp1' or (block_size > 0 and variant['ps'] != self.previous_phase_set):
+                if current_haplotype is not None and block_size >= self.min_supporting_variants:
+                    haplotype_blocks.append((block_start, block_end, current_haplotype, block_size))
+                current_haplotype = 'hp1'
+                block_start = pos
+                block_size = 0
+            block_end = pos
+            block_size += 1
+        elif alt_seq == variant['hp2']:
+            haplotype_str = '2'
+            hp2_count += 1
+            if current_haplotype != 'hp2' or (block_size > 0 and variant['ps'] != self.previous_phase_set):
+                if current_haplotype is not None and block_size >= self.min_supporting_variants:
+                    haplotype_blocks.append((block_start, block_end, current_haplotype, block_size))
+                current_haplotype = 'hp2'
+                block_start = pos
+                block_size = 0
+            block_end = pos
+            block_size += 1
+        else:
+            haplotype_str = 'x'  # Unphased or unrecognized haplotype
+
+        # Update the previous phase set
+        self.previous_phase_set = variant['ps']
+
+        # Construct variant string for reporting
+        variant_str = f"{pos}:{'+'+alt_seq if cigar_op == 1 else '-'+ref_seq}:{'hp'+haplotype_str}:{variant['ps']}"
+
+        return hp1_count, hp2_count, current_haplotype, block_start, block_end, block_size, variant_str, haplotype_str, \
+            variant['ps']
+
+
 def defaultdict_of_dict():
     return defaultdict(dict)
+
+def levenshtein_distance(seq1, seq2):
+    """
+    Calculates the Levenshtein distance between two sequences (seq1 and seq2).
+    This metric allows insertion, deletion, or substitution with a cost of 1 for each.
+    """
+    len1, len2 = len(seq1), len(seq2)
+    matrix = [[0] * (len2 + 1) for _ in range(len1 + 1)]
+
+    for i in range(len1 + 1):
+        matrix[i][0] = i
+    for j in range(len2 + 1):
+        matrix[0][j] = j
+
+    for i in range(1, len1 + 1):
+        for j in range(1, len2 + 1):
+            if seq1[i - 1] == seq2[j - 1]:
+                cost = 0
+            else:
+                cost = 1
+            matrix[i][j] = min(matrix[i - 1][j] + 1,      # Deletion
+                               matrix[i][j - 1] + 1,      # Insertion
+                               matrix[i - 1][j - 1] + cost)  # Substitution
+
+    return matrix[len1][len2]
 
 
 def parse_vcf(vcf_file):
@@ -547,3 +671,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
