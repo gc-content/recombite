@@ -4,6 +4,7 @@ import argparse  # Import the argparse module
 from collections import defaultdict  # Import the defaultdict class from the collections module
 import sys  # Import the sys module
 import multiprocessing
+import numpy as np
 
 
 def get_chromosome_ranges(bam_file, num_chunks):
@@ -25,11 +26,13 @@ def get_chromosome_ranges(bam_file, num_chunks):
     return chromosome_ranges
 
 
-def process_bam_chunk(bam_file, variants, min_supporting_variants, continuity_threshold, switch_threshold,
-                      dominant_fraction_threshold, min_mapping_quality, min_read_length, chunk, min_variant_quality):
+def process_bam_chunk(bam_file, variants, min_supporting_variants, local_switch_threshold, switch_threshold,
+                      dominant_fraction_threshold, min_mapping_quality, min_read_length, chunk, min_variant_quality,
+                      k_consecutive, window_size):
     chromosome, start, end = chunk
-    analyzer = HaplotypeAnalyzer(variants, min_supporting_variants, continuity_threshold,
-                                 switch_threshold, dominant_fraction_threshold, min_variant_quality, k_consecutive=3)
+    analyzer = HaplotypeAnalyzer(variants, min_supporting_variants, local_switch_threshold,
+                                 switch_threshold, dominant_fraction_threshold, min_variant_quality,
+                                 k_consecutive, window_size)
     results = []
 
     with pysam.AlignmentFile(bam_file, "rb") as bam:
@@ -43,15 +46,17 @@ def process_bam_chunk(bam_file, variants, min_supporting_variants, continuity_th
     return results
 
 
-def process_bam(bam_file, variants, min_supporting_variants, continuity_threshold, switch_threshold,
-                dominant_fraction_threshold, min_mapping_quality, min_read_length, min_variant_quality, num_workers=4):
+def process_bam(bam_file, variants, min_supporting_variants, local_switch_threshold, switch_threshold,
+                dominant_fraction_threshold, min_mapping_quality, min_read_length, min_variant_quality, num_workers,
+                k_consecutive, window_size):
     chromosome_ranges = get_chromosome_ranges(bam_file, num_workers)
 
     with multiprocessing.Pool(processes=num_workers) as pool:
         results = pool.starmap(
             process_bam_chunk,
-            [(bam_file, variants, min_supporting_variants, continuity_threshold, switch_threshold,
-              dominant_fraction_threshold, min_mapping_quality, min_read_length, chunk, min_variant_quality)
+            [(bam_file, variants, min_supporting_variants, local_switch_threshold, switch_threshold,
+              dominant_fraction_threshold, min_mapping_quality, min_read_length, chunk, min_variant_quality,
+              k_consecutive, window_size)
              for chunk in chromosome_ranges]
         )
 
@@ -60,11 +65,11 @@ def process_bam(bam_file, variants, min_supporting_variants, continuity_threshol
 
 
 class HaplotypeAnalyzer:
-    def __init__(self, variants, min_supporting_variants, continuity_threshold, switch_threshold,
-                 dominant_fraction_threshold=0.9, min_variant_quality=20, k_consecutive=3):
+    def __init__(self, variants, min_supporting_variants, local_switch_threshold, switch_threshold,
+                 dominant_fraction_threshold, min_variant_quality, k_consecutive, window_size):
         self.variants = variants
         self.min_supporting_variants = min_supporting_variants
-        self.continuity_threshold = continuity_threshold
+        self.local_switch_threshold = local_switch_threshold
         self.switch_threshold = switch_threshold
         self.dominant_fraction_threshold = dominant_fraction_threshold
         self.previous_read_info = {}  # Dictionary to store the last read's information
@@ -73,6 +78,7 @@ class HaplotypeAnalyzer:
         self.consecutive_reads = defaultdict(list)  # Store last reads info for each line/chromosome combination
         self.current_haplotype_state = defaultdict(lambda: {'haplotype': None, 'count': 0})
         self.previous_phase_set = None
+        self.window_size = window_size
 
 
     def calculate_score(self, read):
@@ -146,7 +152,7 @@ class HaplotypeAnalyzer:
         # Calculate the dominant haplotype for the current read
         dominant_haplotype, dominant_fraction = self.calculate_dominant_haplotype("".join(haplotype_string))
         switch_score = self.calculate_phase_switches("".join(haplotype_string))
-        con_score = self.calculate_consecutiveness_score("".join(haplotype_string))
+        local_switch_score = self.local_td_max("".join(haplotype_string), self.window_size)
 
         dominant_phase_set = max(ps_list, key=ps_list.count) if ps_list else None
 
@@ -157,11 +163,11 @@ class HaplotypeAnalyzer:
         (is_recombinant, breakpoints, previous_read_id,
          scored_read_id,scored_read_start,scored_read_haplotype_blocks,
          scored_read_variant_string,scored_read_haplotype_string,
-         scored_read_switch_score,scored_read_con_score
+         scored_read_switch_score, scored_read_local_switch_score
          )= (False, [], None, None,None,[],[],[],None,None ) if not haplotype_blocks else self.is_recombinant(
-            chrom_line_key, haplotype_blocks, switch_score, con_score, dominant_haplotype, dominant_fraction,
+            chrom_line_key, haplotype_blocks, switch_score, dominant_haplotype, dominant_fraction,
             dominant_phase_set, read.query_name, line, read.query_name, read.reference_start, variant_string,
-            haplotype_string
+            haplotype_string, local_switch_score
         )
 
         # Store the current read's info if it has a valid dominant haplotype
@@ -185,12 +191,12 @@ class HaplotypeAnalyzer:
             'breakpoints': breakpoints,
             'line': line,
             'switch_score': scored_read_switch_score,
-            'con_score': scored_read_con_score
+            'local_switch_score': scored_read_local_switch_score
         }
 
-    def is_recombinant(self, chrom_line_key, haplotype_blocks, switch_score, con_score,
+    def is_recombinant(self, chrom_line_key, haplotype_blocks, switch_score,
                        dominant_haplotype, dominant_fraction, dominant_phase_set, read_name, line,
-                       read_id, read_start, variant_string, haplotype_string):
+                       read_id, read_start, variant_string, haplotype_string, local_switch_score):
         """Determines if the current read is recombinant, based on single-read and multi-read logic."""
         # Initialize recombination status
         is_recombinant = False
@@ -200,20 +206,20 @@ class HaplotypeAnalyzer:
         # Check for single-read recombination
         (single_read_recombinant, single_read_breakpoints,
             previous_read_id, read_id, read_start, haplotype_blocks,
-         variant_string, haplotype_string, switch_score, con_score
-         )= self.is_single_read_recombinant(haplotype_blocks, switch_score, con_score, previous_read_id, read_id, read_start, variant_string, haplotype_string)
+         variant_string, haplotype_string, switch_score, local_switch_score
+         )= self.is_single_read_recombinant(haplotype_blocks, switch_score, previous_read_id, read_id, read_start, variant_string, haplotype_string, local_switch_score)
         if single_read_recombinant:
             is_recombinant = True
             breakpoints = single_read_breakpoints
 
         # Check for multi-read recombination if no single-read recombination occurred
-        if not is_recombinant and dominant_haplotype is not None and line != "none" and dominant_fraction >= self.dominant_fraction_threshold:
+        if not is_recombinant and dominant_haplotype is not None and dominant_fraction >= self.dominant_fraction_threshold:
             (multi_read_recombinant, multi_read_breakpoints,
             previous_read_id, read_id, read_start, haplotype_blocks,
-            variant_string, haplotype_string, switch_score, con_score
+            variant_string, haplotype_string, switch_score,  local_switch_score
             )= self.is_multi_read_recombinant(
                 chrom_line_key, dominant_haplotype, haplotype_blocks, read_name, dominant_phase_set, read_start, variant_string,
-                haplotype_string, switch_score, con_score
+                haplotype_string, switch_score, local_switch_score
             )
             if multi_read_recombinant:
                 is_recombinant = True
@@ -226,11 +232,10 @@ class HaplotypeAnalyzer:
         haplotype_blocks,
         variant_string,
         haplotype_string,
-        switch_score,
-        con_score)
+        switch_score, local_switch_score)
 
-    def is_single_read_recombinant(self, haplotype_blocks, switch_score, con_score,
-                                   previous_read_id, read_id, read_start, variant_string, haplotype_string):
+    def is_single_read_recombinant(self, haplotype_blocks, switch_score,
+                                   previous_read_id, read_id, read_start, variant_string, haplotype_string, local_switch_score):
         """Checks if the recombination event is within the single read."""
         is_recombinant = False
         breakpoints = []
@@ -239,7 +244,7 @@ class HaplotypeAnalyzer:
             if (haplotype_blocks[i][3] >= self.min_supporting_variants and
                     haplotype_blocks[i + 1][3] >= self.min_supporting_variants and
                     haplotype_blocks[i][2] != haplotype_blocks[i + 1][2]) and (
-                    switch_score < self.switch_threshold and con_score > self.continuity_threshold):
+                    switch_score < self.switch_threshold and local_switch_score < self.local_switch_threshold):
                 is_recombinant = True
                 end_pos1 = haplotype_blocks[i][1]
                 start_pos2 = haplotype_blocks[i + 1][0]
@@ -252,12 +257,11 @@ class HaplotypeAnalyzer:
                 haplotype_blocks,
                 variant_string,
                 haplotype_string,
-                switch_score,
-                con_score)
+                switch_score, local_switch_score)
 
     def is_multi_read_recombinant(self, chrom_line_key, current_haplotype, current_haplotype_blocks,
                                   read_name, dominant_phase_set, read_start, variant_string,
-                                  haplotype_string, switch_score, con_score):
+                                  haplotype_string, switch_score, local_switch_score):
         """Checks if the recombination event involves consecutive reads before and after a switch and calculates the correct breakpoints."""
         is_recombinant = False
         previous_read_id = None
@@ -295,7 +299,7 @@ class HaplotypeAnalyzer:
             'read_variant_string': variant_string,
             'read_haplotype_string': haplotype_string,
             'read_switch_score': switch_score,
-            'read_con_score': con_score
+            'read_local_switch_score': local_switch_score
         })
 
         # Ensure we are only looking at the last `2 * k_consecutive` reads
@@ -306,8 +310,8 @@ class HaplotypeAnalyzer:
         if len(self.consecutive_reads[chrom_line_key]) < 2 * self.k_consecutive:
             return (is_recombinant, breakpoints, previous_read_id,
                     read_name, read_start, current_haplotype_blocks, variant_string,
-                    haplotype_string, switch_score, con_score
-                    )
+                    haplotype_string, switch_score, local_switch_score)
+
 
 
         scored_read = self.consecutive_reads[chrom_line_key][self.k_consecutive]
@@ -317,7 +321,7 @@ class HaplotypeAnalyzer:
         scored_read_variant_string = scored_read['read_variant_string']
         scored_read_haplotype_string = scored_read['read_haplotype_string']
         scored_read_switch_score = scored_read['read_switch_score']
-        scored_read_con_score = scored_read['read_con_score']
+        scored_read_local_switch_score = scored_read['read_local_switch_score']
 
         # Extract the reads before, during, and after the potential crossover event
         reads_before = self.consecutive_reads[chrom_line_key][:self.k_consecutive-1]
@@ -349,7 +353,7 @@ class HaplotypeAnalyzer:
         scored_read_variant_string,
         scored_read_haplotype_string,
         scored_read_switch_score,
-        scored_read_con_score)
+        scored_read_local_switch_score)
 
     def _calculate_breakpoints(self, reads_before, reads_after):
         """
@@ -391,32 +395,67 @@ class HaplotypeAnalyzer:
 
     @staticmethod
     def calculate_phase_switches(haplotype_string):
-        """Calculates the phase switches in the haplotype string."""
-        switches = sum(1 for i in range(1, len(haplotype_string)) if
-                       haplotype_string[i] != haplotype_string[i - 1] and haplotype_string[i] in '12')
-        return switches / len(haplotype_string) if haplotype_string else 0
+        """Calculates the phase switches in the haplotype string, ignoring 'x' characters."""
+        if not haplotype_string:
+            return 0
+
+        # Initialize variables
+        switches = 0
+        effective_length = 0
+        previous_char = None
+
+        # Iterate over the haplotype string, skipping 'x' characters
+        for char in haplotype_string:
+            if char == 'x':
+                continue  # Skip 'x' characters entirely
+            if previous_char and char != previous_char:
+                switches += 1  # Count a switch if the current char is different from the last valid char
+            previous_char = char  # Update the previous valid character
+            effective_length += 1  # Only count valid characters in the effective length
+
+        # Calculate the normalized switch count
+        return switches / effective_length if effective_length > 0 else 0
 
     @staticmethod
+    def local_td_max(haplotype_string, window_size):
+        """Calculates the maximum phase switch count in windows of the haplotype string, where each window only counts real (non-'x') characters."""
 
-    ## It's a shitty metric, think about squaring the score to give more weight to longer consecutive blocks
-    ## And normalizing by the length of the haplotype string or number of blocks
-    def calculate_consecutiveness_score(haplotype_string):
-        def score_for_haplotype(hap):
-            score, consecutive, total_count = 0, 0, haplotype_string.count(hap)
-            for char in haplotype_string:
-                if char == hap:
-                    consecutive += 1
-                    score += consecutive
-                elif char == 'x':
-                    continue
-                else:
-                    consecutive = 0
-            return score / total_count if total_count else 0
+        # Filter out 'x' characters and create a list of indices for valid windows
+        real_positions = [i for i, char in enumerate(haplotype_string) if char != 'x']
 
-        score_1 = score_for_haplotype('1')
-        score_2 = score_for_haplotype('2')
-        average_score = (score_1 + score_2) / 2
-        return average_score / len(haplotype_string) if haplotype_string else 0
+        # If there aren't enough real positions to form a window, calculate transitions for the entire sequence
+        if len(real_positions) < window_size:
+            transition_count = 0
+            previous_char = None
+
+            for i in real_positions:
+                char = haplotype_string[i]
+                if previous_char and char != previous_char:
+                    transition_count += 1  # Count transition
+                previous_char = char
+
+            return transition_count
+
+        # Initialize list to store transition counts for each valid window
+        transitions = []
+
+        # Slide the "window" across the real positions only
+        for start in range(len(real_positions) - window_size + 1):
+            window_indices = real_positions[start:start + window_size]  # Indices of the current window
+            transition_count = 0
+            previous_char = haplotype_string[window_indices[0]]  # Start with the first character in the window
+
+            # Count transitions within the window
+            for idx in window_indices[1:]:
+                char = haplotype_string[idx]
+                if char != previous_char:
+                    transition_count += 1
+                previous_char = char
+
+            transitions.append(transition_count)
+
+        # Return the maximum transition count found in any window
+        return max(transitions) if transitions else 0
 
     def _process_snp(self, read, pos, var, hp1_count, hp2_count, current_haplotype, block_start, block_end, ref_pos,
                      haplotype_blocks, block_size):
@@ -618,30 +657,38 @@ def main():
     parser = argparse.ArgumentParser(description="Detect recombination events in reads.")
     parser.add_argument("-v", "--vcf", required=True, help="Input VCF file with phased variants.")
     parser.add_argument("-b", "--bam", required=True, help="Input BAM file with aligned reads.")
-    parser.add_argument("-m", "--min_supporting_variants", type=int, default=5,
+    parser.add_argument("-m", "--min_supporting_variants", type=int, default=4,
                         help="Minimum number of supporting variants to consider a phase switch.")
-    parser.add_argument("-t", "--threads", type=int, default=4, help="Number of worker processes to use.")
+    parser.add_argument("-t", "--threads", type=int, default=multiprocessing.cpu_count(), help="Number of worker processes to use.")
     parser.add_argument("-o", "--output", help="Output file to write results. Writes to stdout if not specified.")
-    parser.add_argument("-c", "--continuity_threshold", type=float, default=0.15,
-                        help="Threshold for continuity score to determine recombination.")
-    parser.add_argument("-s", "--switch_threshold", type=float, default=0.1,
+    parser.add_argument("-s", "--switch_threshold", type=float, default=1,
                         help="Threshold for switch score to determine recombination.")
     parser.add_argument("--dominant_fraction_threshold", type=float, default=0.9,
                         help="Fraction threshold for determining dominant haplotype.")
     parser.add_argument("--min_variant_quality", type=int, default=20, help="Minimum quality score for variants.")
     parser.add_argument("--min_mapping_quality", type=int, default=50, help="Minimum mapping quality for reads.")
     parser.add_argument("--min_read_length", type=int, default=1000, help="Minimum read length.")
+    parser.add_argument("-k", "--k_consecutive", type=int, default=3, help="Minimal number of consecutive reads of given haplotype spanning the event to consider multi-read recombination.")
+    parser.add_argument("-w", "--window_size", type=int, default=10, help="Window size for local switch score calculation.")
+    parser.add_argument("-l", "--local_switch_threshold", type=int,
+                        help="Threshold for local phase switches to determine recombination. Defaults to window size if not specified.")
+    parser.add_argument("--version", action="version", version="%(prog)s 1.0")
     args = parser.parse_args()
 
+    # Set local switch threshold to window size if not specified
+    if args.local_switch_threshold is None:
+        args.local_switch_threshold = args.window_size
+
     variants = parse_vcf(args.vcf)
-    results = process_bam(args.bam, variants, args.min_supporting_variants, args.continuity_threshold,
+    results = process_bam(args.bam, variants, args.min_supporting_variants, args.local_switch_threshold,
                           args.switch_threshold, args.dominant_fraction_threshold, args.min_mapping_quality,
-                          args.min_read_length, args.min_variant_quality, num_workers=args.threads)
+                          args.min_read_length, args.min_variant_quality, args.threads, args.k_consecutive,
+                          args.window_size)
 
     output_file = sys.stdout if args.output is None else open(args.output, 'w')
 
     # Updated header to include previous_read_id
-    header = "ReadID\tLine\tChromosome\tStartPos\tIsRecombinant\tPreviousReadID\tHaplotypeBlocks\tVariantString\tHaplotypeString\tBreakpoints\tSwitchScore\tConScore\n"
+    header = "ReadID\tLine\tChromosome\tStartPos\tIsRecombinant\tPreviousReadID\tHaplotypeBlocks\tVariantString\tHaplotypeString\tBreakpoints\tSwitchScore\tLocalSwitchScore\n"
     output_file.write(header)
 
     for result in results:
@@ -661,7 +708,7 @@ def main():
             f"{result['haplotype_string']}\t"
             f"{breakpoints_str}\t"
             f"{result['switch_score']}\t"
-            f"{result['con_score']}\n"
+            f"{result['local_switch_score']}\n"
         )
         output_file.write(line)
 
