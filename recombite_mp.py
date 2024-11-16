@@ -11,6 +11,8 @@ def get_chromosome_ranges(bam_file, num_chunks):
     """
     Divide the BAM file's reference chromosomes into ranges for parallel processing.
     Ensure that each chunk range is exclusive of the end to avoid overlapping processing.
+    Warning: chunking will cause reads that overlap the chunk boundaries to be processed by multiple workers.
+    Therefore some events might be missed.
     """
     bam = pysam.AlignmentFile(bam_file, "rb")
     chromosome_ranges = []
@@ -93,6 +95,7 @@ class HaplotypeAnalyzer:
         ref_pos = read.reference_start
         query_pos = 0
         ps_list = []
+        last_ins_pos = ref_pos
 
         try:
             line = read.get_tag("LN")
@@ -103,6 +106,8 @@ class HaplotypeAnalyzer:
             if cigar_op in [0, 7, 8]:  # Match, =, X (regular aligned bases)
                 for i in range(length):
                     pos = ref_pos + i
+                    if pos == last_ins_pos:
+                        pos += 1
                     if read.reference_name in self.variants and pos in self.variants[read.reference_name]:
                         if read.query_qualities[query_pos + i-1] < self.min_variant_quality:  # SNP-specific quality check
                             variant_string.append(
@@ -110,24 +115,33 @@ class HaplotypeAnalyzer:
                             continue
 
                         var = self.variants[read.reference_name][pos]
+
                         if len(var['ref']) == 1 and len(var['alt']) == 1:  # SNP case
-                            # Process SNPs
+
                             hp1_count, hp2_count, current_haplotype, block_start, block_end, block_size, variant_str, haplotype_str, phase_set = self._process_snp(
                                 read, query_pos + i - 1, var, hp1_count, hp2_count, current_haplotype, block_start,
                                 block_end, pos, haplotype_blocks, block_size
                             )
-                            ps_list.append(phase_set)
-                            variant_string.append(variant_str)
-                            haplotype_string.append(haplotype_str)
+
+                        else:  # Indel case (CIGAR 0 with variant, no insertion or deletion)
+                            hp1_count, hp2_count, current_haplotype, block_start, block_end, block_size, variant_str, haplotype_str, phase_set = self._process_cigar0_indel(
+                                read, query_pos+i-1, var, hp1_count, hp2_count, current_haplotype, block_start,
+                                block_end, pos,
+                                haplotype_blocks, block_size
+                            )
+                        ps_list.append(phase_set)
+                        variant_string.append(variant_str)
+                        haplotype_string.append(haplotype_str)
 
                 query_pos += length
                 ref_pos += length
 
             elif cigar_op == 1 or cigar_op == 2:  # Insertions or Deletions
                 pos = ref_pos if cigar_op == 2 else ref_pos   # For deletions, pos should be at ref_pos; for insertions, it's at the prior position.
+               # print(pos)
+
                 if read.reference_name in self.variants and pos in self.variants[read.reference_name]:
                     var = self.variants[read.reference_name][pos]
-
                     # Process Indels (either insertion or deletion based on cigar_op)
                     hp1_count, hp2_count, current_haplotype, block_start, block_end, block_size, variant_str, haplotype_str, phase_set = self._process_indel(
                         read, query_pos , var, hp1_count, hp2_count, current_haplotype, block_start, block_end, pos,
@@ -140,6 +154,7 @@ class HaplotypeAnalyzer:
                 # Advance positions after indels (insertion affects query position, deletion affects reference position)
                 if cigar_op == 1:  # Insertion
                     query_pos += length
+                    last_ins_pos = pos  ## can't increment ref_pos here, this will prevent running case cigar0 on insertion
                 elif cigar_op == 2:  # Deletion
                     ref_pos += length
 
@@ -515,9 +530,81 @@ class HaplotypeAnalyzer:
 
         # Update the previous phase set to the current one
         self.previous_phase_set = current_phase_set
-
         return hp1_count, hp2_count, current_haplotype, block_start, block_end, block_size, variant_str, haplotype_str, \
         var['ps']
+
+    def _process_cigar0_indel(self, read, query_pos, var, hp1_count, hp2_count, current_haplotype,
+                              block_start, block_end, pos, haplotype_blocks, block_size):
+        """
+        Processes a CIGAR=0 overlap at an indel variant site, assigning the correct haplotype based
+        on whether the reference allele is associated with hp1 or hp2.
+
+        Parameters:
+        - read: The read object.
+        - query_pos: Position in the read's query sequence.
+        - var (dict): Variant data from the VCF, containing 'hp1', 'hp2', 'ps' (phase set).
+        - hp1_count, hp2_count: Haplotype counts for tracking consistency.
+        - current_haplotype: Currently observed haplotype.
+        - block_start, block_end: Start and end of the current haplotype block.
+        - pos: Reference position of the variant.
+        - haplotype_blocks: List for appending haplotype blocks.
+        - block_size: Size of the current block.
+
+        Returns:
+        - Updated hp1_count, hp2_count, current_haplotype, block_start, block_end, block_size,
+          variant_str, haplotype_str, phase_set
+        """
+
+        if len(var['alt']) > len(var['ref']):  # Insertion
+
+            if read.query_sequence[query_pos] == var['ref']:
+                if var['ref'] == var['hp1']:
+                    haplotype_str = '1'
+                elif var['ref'] == var['hp2']:
+                    haplotype_str = '2'
+            else:
+                haplotype_str = 'x'
+
+            variant_str = f"{pos}:{'no_ins'}:{'hp' + haplotype_str}"
+
+        elif len(var['alt']) < len(var['ref']):
+
+            if read.query_sequence[query_pos] == var['alt']:
+                if var['alt'] == var['hp1']:
+                    haplotype_str = '2'  # Reference allele corresponds to hp1
+                elif var['alt'] == var['hp2']:
+                    haplotype_str = '1'  # Reference allele corresponds to hp2
+            else:
+                haplotype_str = 'x'
+
+            variant_str = f"{pos}:{'no_del'}:{'hp' + haplotype_str}"
+
+        # Get the phase set from the variant
+        current_phase_set = var['ps']
+
+        if haplotype_str != 'x':
+            # Assign haplotype based on phase set and reference allele (either hp1 or hp2)
+            if haplotype_str == '1':  # Reference allele corresponds to hp1
+                hp1_count += 1
+            elif haplotype_str == '2':  # Reference allele corresponds to hp2
+                hp2_count += 1
+
+            # Check for haplotype block switch based on current haplotype and phase set
+            if current_haplotype != "hp"+haplotype_str or (block_size > 0 and current_phase_set != self.previous_phase_set):
+                if current_haplotype is not None and block_size >= self.min_supporting_variants:
+                    haplotype_blocks.append((block_start, block_end, current_haplotype, block_size))
+                current_haplotype = "hp"+haplotype_str  # Align with either hp1 or hp2 based on reference
+                block_start = pos  # Start a new block
+                block_size = 0
+
+            block_end = pos
+            block_size += 1
+
+        # Update the previous phase set for future comparisons
+        self.previous_phase_set = current_phase_set
+
+
+        return hp1_count, hp2_count, current_haplotype, block_start, block_end, block_size, variant_str, haplotype_str, current_phase_set
 
     def _process_indel(self, read, query_pos, variant, hp1_count, hp2_count, current_haplotype, block_start, block_end,
                        pos, haplotype_blocks, block_size, cigar_op,length):
@@ -545,8 +632,6 @@ class HaplotypeAnalyzer:
             max_mismatches = int(len(alt_seq) * tolerance_percentage)
 
             if levenshtein_dist > max_mismatches:
-                #print(variant, file=sys.stderr)
-                #print(f"{read.query_name} {pos} {read_seq} {alt_seq} {levenshtein_dist} {max_mismatches}", file=sys.stderr)
                 return hp1_count, hp2_count, current_haplotype, block_start, block_end, block_size, f"{pos}:+{alt_seq}:mismatch", "", None
 
         # Handle deletions
@@ -560,8 +645,6 @@ class HaplotypeAnalyzer:
 
             # If the CIGAR length is outside the allowed range, report a length mismatch
             if not (min_length <= length <= max_length):  # `length` comes from the CIGAR tuple
-                #print(variant, file=sys.stderr)
-                #print (f"{read.query_name} {pos} {deletion_length} {length} {min_length} {max_length}", file=sys.stderr)
                 return hp1_count, hp2_count, current_haplotype, block_start, block_end, block_size, f"{pos}:-{ref_seq}:length_mismatch", "", None
 
         # Determine the haplotype from the variant (not the read!)
@@ -595,7 +678,6 @@ class HaplotypeAnalyzer:
 
         # Construct variant string for reporting
         variant_str = f"{pos}:{'+'+alt_seq if cigar_op == 1 else '-'+ref_seq}:{'hp'+haplotype_str}:{variant['ps']}"
-
         return hp1_count, hp2_count, current_haplotype, block_start, block_end, block_size, variant_str, haplotype_str, \
             variant['ps']
 
@@ -716,6 +798,6 @@ def main():
         output_file.close()
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+     main()
 
